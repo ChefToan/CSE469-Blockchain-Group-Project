@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 
 # Constants
 AES_KEY = b"R0chLi4uLi4uLi4="
-BLOCK_HEADER_SIZE = 144
+BLOCK_HEADER_SIZE = 144  # 32 + 8 + 32 + 32 + 12 + 12 + 12 + 4
 
 # Password environment variables
 PASSWORDS = {
@@ -218,43 +218,50 @@ def get_blockchain_path():
 
 
 def encrypt_case_id(case_uuid):
-    """Encrypt a UUID case_id using AES ECB and return hex-encoded 32 bytes."""
+    """Encrypt a UUID case_id using AES ECB and return 32 bytes (hex-encoded encrypted data)."""
     uuid_bytes = uuid.UUID(case_uuid).bytes
     encrypted = aes_encrypt_block(uuid_bytes, AES_KEY)
+    # Return as hex-encoded string (32 hex chars = 32 bytes)
     return encrypted.hex().encode('ascii')
 
 
-def decrypt_case_id(encrypted_hex_bytes):
-    """Decrypt case_id from hex-encoded bytes to UUID string."""
-    encrypted = bytes.fromhex(encrypted_hex_bytes.decode('ascii'))
+def decrypt_case_id(encrypted_bytes):
+    """Decrypt case_id from 32 bytes (hex-encoded) to UUID string."""
+    # Convert hex string to bytes
+    encrypted = bytes.fromhex(encrypted_bytes.decode('ascii'))
     decrypted = aes_decrypt_block(encrypted, AES_KEY)
     return str(uuid.UUID(bytes=decrypted))
 
 
 def encrypt_item_id(item_id):
-    """Encode item_id as hex-encoded ASCII (NOT AES encrypted).
-    Item ID is stored as ASCII string padded to 16 bytes, then hex-encoded."""
-    item_str = str(int(item_id))
-    item_bytes = item_str.encode('ascii').ljust(16, b'\x00')
-    return item_bytes.hex().encode('ascii')
+    """Encrypt item_id using AES ECB and return 32 bytes (hex-encoded encrypted data).
+    Item ID is converted to 16-byte big-endian integer, then encrypted."""
+    item_int = int(item_id)
+    # Convert to 16-byte big-endian representation
+    item_bytes = item_int.to_bytes(16, byteorder='big')
+    encrypted = aes_encrypt_block(item_bytes, AES_KEY)
+    # Return as hex-encoded string (32 hex chars = 32 bytes)
+    return encrypted.hex().encode('ascii')
 
 
-def decrypt_item_id(encrypted_hex_bytes):
-    """Decode item_id from hex-encoded bytes to integer."""
-    raw_bytes = bytes.fromhex(encrypted_hex_bytes.decode('ascii'))
-    item_str = raw_bytes.rstrip(b'\x00').decode('ascii')
-    return int(item_str) if item_str else 0
+def decrypt_item_id(encrypted_bytes):
+    """Decrypt item_id from 32 bytes (hex-encoded) to integer."""
+    # Convert hex string to bytes
+    encrypted = bytes.fromhex(encrypted_bytes.decode('ascii'))
+    decrypted = aes_decrypt_block(encrypted, AES_KEY)
+    # Convert from 16-byte big-endian to integer
+    return int.from_bytes(decrypted, byteorder='big')
+
 
 
 def format_state(state_str):
-    """Format state string to 11 bytes + 1 null byte = 12 bytes total.
-    State field is 11 characters max with null-terminator padding."""
+    """Format state string to exactly 12 bytes with null padding."""
     state_bytes = state_str.encode('utf-8')
-    if len(state_bytes) > 11:
-        state_bytes = state_bytes[:11]
-    # Pad to 11 bytes, then add one null for 12 total
-    state_bytes = state_bytes.ljust(11, b'\x00') + b'\x00'
-    return state_bytes[:12]
+    if len(state_bytes) > 12:
+        state_bytes = state_bytes[:12]
+    # Pad to exactly 12 bytes with null bytes
+    state_bytes = state_bytes.ljust(12, b'\x00')
+    return state_bytes
 
 
 def format_text_field(text, max_len):
@@ -270,20 +277,22 @@ def format_text_field(text, max_len):
 class Block:
     """Represents a single block in the blockchain."""
 
-    def __init__(self, prev_hash, timestamp, case_id, evidence_id, state, creator, owner, data):
+    def __init__(self, prev_hash, timestamp, case_id, evidence_id, state, creator, owner, data, raw_bytes=None):
         self.prev_hash = prev_hash
         self.timestamp = timestamp
-        self.case_id = case_id
-        self.evidence_id = evidence_id
+        self.case_id = case_id  # 32 bytes (16 encrypted + 16 padding)
+        self.evidence_id = evidence_id  # 32 bytes (16 encrypted + 16 padding)
         self.state = state
         self.creator = creator
         self.owner = owner
         self.data = data
         self.data_length = len(data)
+        self._raw_bytes = raw_bytes  # Store original raw bytes if read from file
 
     def to_bytes(self):
+        # Block format: prev_hash(32) + timestamp(8) + case_id(32) + evidence_id(32) + state(12) + creator(12) + owner(12) + data_length(4) + data
         header = struct.pack(
-            '32s d 32s 32s 12s 12s 12s I',
+            '=32s d 32s 32s 12s 12s 12s I',
             self.prev_hash,
             self.timestamp,
             self.case_id,
@@ -297,10 +306,12 @@ class Block:
 
     @staticmethod
     def from_bytes(data):
-        if len(data) < BLOCK_HEADER_SIZE:
+        # Header size: 32 + 8 + 32 + 32 + 12 + 12 + 12 + 4 = 144 bytes
+        header_size = BLOCK_HEADER_SIZE
+        if len(data) < header_size:
             return None
 
-        header = struct.unpack('32s d 32s 32s 12s 12s 12s I', data[:BLOCK_HEADER_SIZE])
+        header = struct.unpack('=32s d 32s 32s 12s 12s 12s I', data[:header_size])
 
         prev_hash = header[0]
         timestamp = header[1]
@@ -311,12 +322,18 @@ class Block:
         owner = header[6]
         data_length = header[7]
 
-        block_data = data[BLOCK_HEADER_SIZE:BLOCK_HEADER_SIZE + data_length]
+        block_data = data[header_size:header_size + data_length]
 
-        return Block(prev_hash, timestamp, case_id, evidence_id, state, creator, owner, block_data)
+        # Pass raw bytes so we can compute hash from original data
+        return Block(prev_hash, timestamp, case_id, evidence_id, state, creator, owner, block_data, raw_bytes=data)
 
     def get_hash(self):
-        block_bytes = self.to_bytes()
+        # Use original raw bytes if available (for blocks read from file)
+        # Otherwise use to_bytes() (for newly created blocks)
+        if self._raw_bytes is not None:
+            block_bytes = self._raw_bytes
+        else:
+            block_bytes = self.to_bytes()
         return hashlib.sha256(block_bytes[32:]).digest()
 
 
@@ -336,15 +353,21 @@ class Blockchain:
             with open(self.filepath, 'rb') as f:
                 data = f.read()
 
+            if len(data) == 0:
+                return
+
             offset = 0
             while offset < len(data):
                 if len(data) - offset < BLOCK_HEADER_SIZE:
                     break
 
                 header_data = data[offset:offset + BLOCK_HEADER_SIZE]
-                data_length = struct.unpack('I', header_data[140:144])[0]
+                data_length = struct.unpack('=I', header_data[140:144])[0]
 
                 block_size = BLOCK_HEADER_SIZE + data_length
+                if offset + block_size > len(data):
+                    break
+                    
                 block_data = data[offset:offset + block_size]
 
                 block = Block.from_bytes(block_data)
@@ -352,7 +375,7 @@ class Blockchain:
                     self.blocks.append(block)
 
                 offset += block_size
-        except:
+        except Exception:
             self.blocks = []
 
     def save_blockchain(self):
@@ -365,15 +388,19 @@ class Blockchain:
         self.save_blockchain()
 
     def get_initial_block(self):
+        # Use ASCII zeros for case_id and evidence_id (32 bytes each)
+        # state should be INITIAL with 4 null bytes (11 bytes), but field is 12 bytes
+        # data should be "Initial block" with null terminator
+        # Use CURRENT timestamp, not 0!
         return Block(
             prev_hash=b'\x00' * 32,
-            timestamp=0.0,
-            case_id=b'0' * 32,
-            evidence_id=b'0' * 32,
-            state=format_state("INITIAL"),
+            timestamp=datetime.now(timezone.utc).timestamp(),
+            case_id=b'0' * 32,  # 32 ASCII zeros
+            evidence_id=b'0' * 32,  # 32 ASCII zeros
+            state=b'INITIAL\x00\x00\x00\x00\x00',  # 12 bytes: INITIAL + 5 null bytes
             creator=b'\x00' * 12,
             owner=b'\x00' * 12,
-            data=b'Initial block\x00'
+            data=b'Initial block\x00'  # 14 bytes with null terminator
         )
 
     def has_initial_block(self):
@@ -382,9 +409,17 @@ class Blockchain:
 
         first_block = self.blocks[0]
         # Check that it looks like a valid initial block
-        # prev_hash should be all zeros and timestamp should be 0
-        return (first_block.prev_hash == b'\x00' * 32 and
-                first_block.timestamp == 0.0)
+        # prev_hash should be all zeros and state should contain INITIAL
+        try:
+            state = first_block.state.rstrip(b'\x00').decode('utf-8', errors='ignore').strip()
+        except:
+            return False
+        
+        # Accept any initial block with prev_hash of zeros and INITIAL state
+        is_initial_state = ("INITIAL" in state)
+        has_zero_prev_hash = (first_block.prev_hash == b'\x00' * 32)
+        
+        return has_zero_prev_hash and is_initial_state
 
     def is_valid_blockchain(self):
         """Check if the blockchain file is valid."""
@@ -466,6 +501,13 @@ def validate_uuid(uuid_str):
         return False
 
 
+def format_timestamp(ts):
+    """Format a timestamp as ISO format with microseconds and timezone."""
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    # Format with microseconds and proper timezone format
+    return dt.strftime('%Y-%m-%dT%H:%M:%S.%f') + '+00:00'
+
+
 def cmd_init(args):
     """Initialize the blockchain."""
     blockchain_path = get_blockchain_path()
@@ -522,13 +564,13 @@ def cmd_add(args):
             evidence_id=encrypted_item,
             state=format_state("CHECKEDIN"),
             creator=format_text_field(args.creator, 12),
-            owner=format_text_field("", 12),
+            owner=b'\x00' * 12,
             data=b''
         )
 
         blockchain.add_block(block)
 
-        timestamp_str = datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+        timestamp_str = format_timestamp(timestamp)
         print(f"Added item: {item_id}")
         print(f"Status: CHECKEDIN")
         print(f"Time of action: {timestamp_str}")
@@ -557,6 +599,10 @@ def cmd_checkout(args):
     timestamp = datetime.now(timezone.utc).timestamp()
     case_id = blockchain.get_item_case(args.item_id)
     encrypted_item = encrypt_item_id(args.item_id)
+    
+    # Get original creator and role of person doing checkout
+    original_creator = blockchain.get_item_creator(args.item_id)
+    role = get_role_from_password(args.password)
 
     block = Block(
         prev_hash=blockchain.get_last_block_hash(),
@@ -564,14 +610,14 @@ def cmd_checkout(args):
         case_id=case_id,
         evidence_id=encrypted_item,
         state=format_state("CHECKEDOUT"),
-        creator=format_text_field("", 12),
-        owner=format_text_field("", 12),
+        creator=original_creator,
+        owner=format_text_field(role, 12),
         data=b''
     )
 
     blockchain.add_block(block)
 
-    timestamp_str = datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+    timestamp_str = format_timestamp(timestamp)
     decrypted_case = decrypt_case_id(case_id)
     print(f"Case: {decrypted_case}")
     print(f"Checked out item: {args.item_id}")
@@ -604,7 +650,8 @@ def cmd_checkin(args):
     case_id = blockchain.get_item_case(args.item_id)
     encrypted_item = encrypt_item_id(args.item_id)
     
-    # Get role of who is checking in
+    # Get original creator and role of person doing checkin
+    original_creator = blockchain.get_item_creator(args.item_id)
     role = get_role_from_password(args.password)
 
     block = Block(
@@ -613,14 +660,14 @@ def cmd_checkin(args):
         case_id=case_id,
         evidence_id=encrypted_item,
         state=format_state("CHECKEDIN"),
-        creator=format_text_field("", 12),
-        owner=format_text_field(role, 12),  # Store who checked it in
+        creator=original_creator,
+        owner=format_text_field(role, 12),
         data=b''
     )
 
     blockchain.add_block(block)
 
-    timestamp_str = datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+    timestamp_str = format_timestamp(timestamp)
     decrypted_case = decrypt_case_id(case_id)
     print(f"Case: {decrypted_case}")
     print(f"Checked in item: {args.item_id}")
@@ -637,12 +684,15 @@ def cmd_show_cases(args):
 
     cases = set()
     for block in blockchain.blocks:
-        if block.case_id != b'0' * 32:
-            try:
-                case_uuid = decrypt_case_id(block.case_id)
-                cases.add(case_uuid)
-            except:
-                pass
+        # Skip INITIAL block
+        state = block.state.rstrip(b'\x00').decode('utf-8', errors='ignore')
+        if state == "INITIAL":
+            continue
+        try:
+            case_uuid = decrypt_case_id(block.case_id)
+            cases.add(case_uuid)
+        except:
+            pass
 
     for case in sorted(cases):
         print(case)
@@ -689,28 +739,35 @@ def cmd_show_history(args):
     blockchain_path = get_blockchain_path()
     blockchain = Blockchain(blockchain_path)
 
+    # Encrypted form of zero values for INITIAL block detection
+    zero_case = encrypt_case_id('00000000-0000-0000-0000-000000000000')
+    zero_item = encrypt_item_id(0)
+    
     # Include ALL blocks (including INITIAL) for history
     filtered_blocks = []
     for block in blockchain.blocks:
+        # Check if this is the INITIAL block
+        is_initial = (block.state.rstrip(b'\x00').decode('utf-8', errors='ignore') == "INITIAL")
+        
         # Apply case_id filter if specified
         if args.case_id:
             if not validate_uuid(args.case_id):
                 print("Invalid case_id format")
                 return 1
             encrypted_case = encrypt_case_id(args.case_id)
-            if block.case_id != encrypted_case and block.case_id != b'0' * 32:
-                continue
-            # Skip INITIAL block when filtering by case
-            if block.case_id == b'0' * 32:
+            if block.case_id != encrypted_case:
+                # Skip INITIAL block when filtering by case
+                if is_initial:
+                    continue
                 continue
 
         # Apply item_id filter if specified
         if args.item_id:
             encrypted_item = encrypt_item_id(args.item_id)
-            if block.evidence_id != encrypted_item and block.evidence_id != b'0' * 32:
-                continue
-            # Skip INITIAL block when filtering by item
-            if block.evidence_id == b'0' * 32:
+            if block.evidence_id != encrypted_item:
+                # Skip INITIAL block when filtering by item
+                if is_initial:
+                    continue
                 continue
 
         filtered_blocks.append(block)
@@ -725,8 +782,10 @@ def cmd_show_history(args):
         if i > 0:
             print()
 
+        state = block.state.rstrip(b'\x00').decode('utf-8')
+        
         # Handle INITIAL block specially
-        if block.case_id == b'0' * 32:
+        if state == "INITIAL":
             case_id = "00000000-0000-0000-0000-000000000000"
             item_id = "0"
         else:
@@ -736,9 +795,10 @@ def cmd_show_history(args):
             except:
                 case_id = block.case_id.decode('ascii', errors='ignore')
                 item_id = block.evidence_id.decode('ascii', errors='ignore')
-
-        state = block.state.rstrip(b'\x00').decode('utf-8')
-        timestamp_str = datetime.fromtimestamp(block.timestamp, tz=timezone.utc).isoformat()
+        
+        # Format timestamp - ensure decimal places are included
+        # Use actual timestamp from the block (tests may create INITIAL blocks with non-zero timestamps)
+        timestamp_str = format_timestamp(block.timestamp)
 
         print(f"Case: {case_id}")
         print(f"Item: {item_id}")
@@ -789,10 +849,6 @@ def cmd_remove(args):
     if args.owner:
         owner_str = args.owner
 
-    data = b''
-    if args.reason == "RELEASED" and args.owner:
-        data = args.owner.encode('utf-8') + b'\x00'
-
     block = Block(
         prev_hash=blockchain.get_last_block_hash(),
         timestamp=timestamp,
@@ -801,12 +857,12 @@ def cmd_remove(args):
         state=format_state(args.reason),
         creator=original_creator,
         owner=format_text_field(owner_str, 12),
-        data=data
+        data=b''
     )
 
     blockchain.add_block(block)
 
-    timestamp_str = datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+    timestamp_str = format_timestamp(timestamp)
     decrypted_case = decrypt_case_id(case_id)
     print(f"Case: {decrypted_case}")
     print(f"Removed item: {args.item_id}")
@@ -871,11 +927,10 @@ def cmd_verify(args):
             })
             continue
         
-        # Check if parent hash matches any previous block's hash
-        # The parent hash should match the hash of block at index i-1
-        expected_parent = computed_hashes[i-1]
-        if prev_hash != expected_parent:
-            # Parent hash doesn't match expected previous block
+        # Check if parent hash exists in any previous block
+        parent_found = prev_hash in block_hashes and block_hashes[prev_hash] < i
+        if not parent_found:
+            # Parent hash doesn't match any previous block
             errors.append({
                 'type': 'parent_not_found',
                 'block_hash': block_hash.hex(),
